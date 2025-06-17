@@ -11,6 +11,6 @@ const router = express_1.default.Router();
 router.post('/create', checkAuth_1.checkAuth, Chat_1.createChat);
 router.get('/get', checkAuth_1.checkAuth, Chat_1.getChatsByUserId);
 // Message routes
-router.post('/messages/create', checkAuth_1.checkAuth, Chat_1.createMessage);
+router.post('/messages/create', checkAuth_1.checkAuth, Chat_1.createMessage); // Apply multer middleware
 router.get('/messages/:chatId', checkAuth_1.checkAuth, Chat_1.getMessagesByChatId);
 exports.default = router;

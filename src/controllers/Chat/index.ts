@@ -49,8 +49,10 @@ export const getChatsByUserId = async (req: Request, res: Response) => {
 // Create a new message in a chat
 export const createMessage = async (req: Request, res: Response) => {
   try {
-    const { chatId, content, role } = req.body;
-    const userId = req.user?._id; // Assuming user ID is available in req.user
+    const { chatId, content, role, fileUrls } = req.body;
+    console.log(fileUrls, "here")
+    const userId = req.user?._id;
+
 
     if (!userId) {
       return res.status(401).json({ message: 'User not authenticated' });
@@ -70,7 +72,8 @@ export const createMessage = async (req: Request, res: Response) => {
     const newMessage = new Message({
       chat: chatId,
       content,
-      role, // 'user' or 'assistant'
+      role,
+      files: fileUrls
     });
 
     await newMessage.save();

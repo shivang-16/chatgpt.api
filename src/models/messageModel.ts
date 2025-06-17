@@ -4,6 +4,7 @@ export interface IMessage extends Document {
     chat: mongoose.Schema.Types.ObjectId; // Reference to the Chat this message belongs to
     sender: 'user' | 'ai';
     content: string;
+    files?: []; // Optional file field for Cloudinary uploads
     createdAt: Date;
 }
 
@@ -22,6 +23,7 @@ const MessageSchema: Schema = new Schema({
         type: String,
         required: true,
     },
+    files: Array,
     createdAt: {
         type: Date,
         default: Date.now,

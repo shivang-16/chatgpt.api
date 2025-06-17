@@ -39,6 +39,7 @@ const MessageSchema = new mongoose_1.Schema({
         type: String,
         required: true,
     },
+    files: Array,
     createdAt: {
         type: Date,
         default: Date.now,

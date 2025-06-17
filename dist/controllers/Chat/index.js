@@ -59,8 +59,9 @@ exports.getChatsByUserId = getChatsByUserId;
 const createMessage = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
-        const { chatId, content, role } = req.body;
-        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a._id; // Assuming user ID is available in req.user
+        const { chatId, content, role, fileUrls } = req.body;
+        console.log(fileUrls, "here");
+        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a._id;
         if (!userId) {
             return res.status(401).json({ message: 'User not authenticated' });
         }
@@ -75,7 +76,8 @@ const createMessage = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const newMessage = new messageModel_1.default({
             chat: chatId,
             content,
-            role, // 'user' or 'assistant'
+            role,
+            files: fileUrls
         });
         yield newMessage.save();
         // Optional: Add the message ID to the chat's messages array (if you add one to the schema)

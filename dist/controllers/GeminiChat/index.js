@@ -21,9 +21,16 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.geminiChat = void 0;
 const fs_1 = __importDefault(require("fs"));
+const axios_1 = __importDefault(require("axios"));
 const geminiConfig_1 = require("../../config/geminiConfig");
 const mem0ai_1 = __importDefault(require("mem0ai"));
 const mem0 = new mem0ai_1.default({ apiKey: process.env.MEM0_API_KEY });
+console.log(process.env.MEM0_API_KEY);
+// Convert a file URL to base64
+const fetchBase64FromUrl = (url) => __awaiter(void 0, void 0, void 0, function* () {
+    const response = yield axios_1.default.get(url, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data).toString('base64');
+});
 const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, e_1, _b, _c;
     try {
@@ -39,36 +46,40 @@ const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             const searchRes = yield mem0.search(message, {
                 user_id: userId,
                 limit: 3,
-                version: 'v2'
+                version: 'v2',
             });
             if (Array.isArray(searchRes.results)) {
                 memoryContext = searchRes.results.map((r) => r.memory).join('\n');
             }
         }
-        // 3. Prepare message components
         const parts = [];
-        if (memoryContext) {
+        const fileUrls = [];
+        if (memoryContext)
             parts.push(`Memory Context:\n${memoryContext}`);
-        }
-        if (message) {
+        if (message)
             parts.push(`User: ${message}`);
-        }
         if (files === null || files === void 0 ? void 0 : files.length) {
             for (const file of files) {
-                const b64 = fs_1.default.readFileSync(file.path, 'base64');
+                let b64;
+                if (file.path.startsWith('http')) {
+                    b64 = yield fetchBase64FromUrl(file.path);
+                    fileUrls.push(file.path); // ✅ send file URL back
+                }
+                else {
+                    b64 = fs_1.default.readFileSync(file.path, 'base64');
+                    // You can optionally upload to Cloudinary here
+                }
                 parts.push({
-                    inlineData: { data: b64, mimeType: file.mimetype }
+                    inlineData: { data: b64, mimeType: file.mimetype },
                 });
             }
         }
-        // 4. Call Gemini
         const generativeModel = geminiConfig_1.genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
         const chat = generativeModel.startChat({
             history: [],
-            generationConfig: { maxOutputTokens: 2000 }
+            generationConfig: { maxOutputTokens: 2000 },
         });
         const result = yield chat.sendMessageStream(parts);
-        // Stream SSE headers
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -92,10 +103,13 @@ const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             }
             finally { if (e_1) throw e_1.error; }
         }
+        // ✅ Send file URLs at the end
+        res.write(`data: ${JSON.stringify({ type: 'done', fileUrls })}\n\n`);
         res.end();
-        // 5. Save assistant’s reply to memory
         if (assistantResponse) {
-            yield mem0.add([{ role: 'assistant', content: assistantResponse }], { user_id: userId });
+            yield mem0.add([{ role: 'assistant', content: assistantResponse }], {
+                user_id: userId,
+            });
         }
     }
     catch (err) {
