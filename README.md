@@ -1,6 +1,3 @@
-I'll create a README.md file for your project. Here's a comprehensive one that covers all the main aspects:
-
-```markdown:/Users/shivang/Desktop/chatgpt.api/README.md
 # ChatGPT API Project
 
 A Node.js/Express API for ChatGPT-like functionality with Gemini AI integration and Cloudinary file uploads.
