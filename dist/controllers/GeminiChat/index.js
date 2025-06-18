@@ -160,7 +160,7 @@ const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             })));
         }
         const model = geminiConfig_1.genAI.getGenerativeModel({
-            model: 'gemini-1.5-flash',
+            model: 'gemini-2.0-flash',
             generationConfig: { maxOutputTokens: 2000 }
         });
         const chat = model.startChat({ history: fullHistory });
