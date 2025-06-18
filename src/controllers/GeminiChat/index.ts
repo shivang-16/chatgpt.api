@@ -1,5 +1,6 @@
 import fs from 'fs';
 import axios from 'axios';
+import mime from 'mime-types';
 import { Request, Response } from 'express';
 import { genAI } from '../../config/geminiConfig';
 import MemoryClient from 'mem0ai';
@@ -7,9 +8,31 @@ import Message from '../../models/messageModel';
 
 const mem0 = new MemoryClient({ apiKey: process.env.MEM0_API_KEY! });
 
-const fetchBase64FromUrl = async (url: string): Promise<string> => {
-  const response = await axios.get(url, { responseType: 'arraybuffer' });
-  return Buffer.from(response.data).toString('base64');
+const fetchCloudinaryFile = async (url: string): Promise<{ data: string; mimeType: string }> => {
+  try {
+    const cloudinaryUrl = new URL(url);
+    const pathParts = cloudinaryUrl.pathname.split('/');
+    
+    const originalFormat = pathParts[pathParts.length - 1].split('.')[1];
+    
+    cloudinaryUrl.searchParams.set('f_auto', 'true');  
+    cloudinaryUrl.searchParams.set('fl_lossy', 'true'); 
+    
+    const response = await axios.get(cloudinaryUrl.toString(), {
+      responseType: 'arraybuffer',
+      timeout: 10000,
+    });
+
+    return {
+      data: Buffer.from(response.data).toString('base64'),
+      mimeType: response.headers['content-type'] || 
+                mime.lookup(originalFormat || url) || 
+                'application/octet-stream'
+    };
+  } catch (error) {
+    console.error(`Cloudinary fetch error: ${url}`, error);
+    throw new Error(`Failed to fetch Cloudinary file: ${url}`);
+  }
 };
 
 export const geminiChat = async (req: Request, res: Response) => {
@@ -23,8 +46,8 @@ export const geminiChat = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'No message or files provided' });
     }
 
-    // 1. RETRIEVE CONTEXT ================================================
-    // 🧠 Get long-term memory from mem0
+    // 1. CONTEXT RETRIEVAL =================================================
+    // 🧠 Long-term memory
     let longTermMemory: any[] = [];
     try {
       if (userId !== 'guest') {
@@ -39,71 +62,104 @@ export const geminiChat = async (req: Request, res: Response) => {
       console.warn('Memory retrieval failed:', (memErr as Error).message);
     }
 
-    // 💬 Get current chat history
+    // 💬 Chat history with files
     let chatHistory: any[] = [];
     if (chatId) {
       try {
         const messages = await Message.find({ chat: chatId }).sort({ createdAt: 1 });
         
-        // Ensure strict role alternation starting with user
-        let lastRole = '';
-        chatHistory = messages.reduce((acc: any[], m: any) => {
-          if (m.role === 'user' && lastRole !== 'user') {
-            acc.push({ role: 'user', parts: [{ text: m.content }] });
-            lastRole = 'user';
-          } else if (m.role === 'assistant' && lastRole !== 'model') {
-            acc.push({ role: 'model', parts: [{ text: m.content }] });
-            lastRole = 'model';
+        // Process historical messages with files
+        const historyPromises = messages.map(async (msg: any) => {
+          const parts: any[] = [];
+          
+          if (msg.content) {
+            parts.push({ text: msg.content });
           }
-          return acc;
-        }, []);
+          
+          if (msg.files?.length) {
+            const filePromises = msg.files.map(async (fileUrl: string) => {
+              try {
+                const { data, mimeType } = await fetchCloudinaryFile(fileUrl);
+                return {
+                  inlineData: { data, mimeType }
+                };
+              } catch (err) {
+                console.warn(`Skipping historical file: ${fileUrl}`, err);
+                return null;
+              }
+            });
+            
+            const fileParts = (await Promise.all(filePromises)).filter(Boolean);
+            parts.push(...fileParts);
+          }
+          
+          return {
+            role: msg.role === 'user' ? 'user' : 'model',
+            parts
+          };
+        });
+        
+        const rawHistory = await Promise.all(historyPromises);
+        
+        // Ensure role alternation
+        let lastRole = '';
+        chatHistory = rawHistory.filter(entry => {
+          if (entry.parts.length === 0) return false;
+          if (entry.role === lastRole) return false;
+          lastRole = entry.role;
+          return true;
+        });
+        
       } catch (err) {
-        console.warn('Chat history fetch failed:', (err as Error).message);
+        console.warn('Chat history processing failed:', (err as Error).message);
       }
     }
 
-    // Combine memory and history with proper alternation
+    // Combine context sources
     const fullHistory = [...longTermMemory, ...chatHistory];
 
-    // 2. PREPARE CURRENT MESSAGE ========================================
     const parts: any[] = [];
     const fileUrls: string[] = [];
 
     // 💬 Text content
     if (message) parts.push({ text: message });
 
-    // 📎 File attachments
+    // 📎 Current file attachments
     if (files?.length) {
-      for (const file of files) {
+      await Promise.all(files.map(async (file) => {
         try {
-          // Handle remote URLs differently
+          let fileData: { data: string; mimeType: string };
+          
           if (file.path.startsWith('http')) {
-            const b64 = await fetchBase64FromUrl(file.path);
-            parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
-            fileUrls.push(file.path);
-          } 
-          // Local files
-          else {
-            const b64 = fs.readFileSync(file.path, 'base64');
-            parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
-            // Optional: Clean up temp file if needed
+            fileData = await fetchCloudinaryFile(file.path);
+          } else {
+            fileData = {
+              data: fs.readFileSync(file.path, 'base64'),
+              mimeType: file.mimetype
+            };
           }
+          
+          parts.push({
+            inlineData: {
+              data: fileData.data,
+              mimeType: fileData.mimeType
+            }
+          });
+          fileUrls.push(file.path);
         } catch (fileErr) {
-          console.warn('File processing failed:', (fileErr as Error).message);
+          console.warn('Current file processing failed:', (fileErr as Error).message);
         }
-      }
+      }));
     }
 
-    // 3. EXECUTE CHAT ====================================================
     const model = genAI.getGenerativeModel({ 
-      model: 'gemini-2.0-flash',
+      model: 'gemini-1.5-flash',
       generationConfig: { maxOutputTokens: 2000 }
     });
     
     const chat = model.startChat({ history: fullHistory });
     const result = await chat.sendMessageStream(parts);
 
-    // 4. STREAM RESPONSE ================================================
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -120,8 +176,8 @@ export const geminiChat = async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify({ type: 'done', fileUrls })}\n\n`);
     res.end();
 
-    // 5. PERSIST INTERACTION ==========================================
-    // 💾 Save to database (if chatId exists)
+    // 5. DATA PERSISTENCE =================================================
+    // 💾 Save to database
     if (chatId) {
       try {
         if (message || files.length) {
@@ -129,7 +185,7 @@ export const geminiChat = async (req: Request, res: Response) => {
             chat: chatId,
             role: 'user',
             content: message || "Uploaded file(s)",
-            attachments: fileUrls
+            files: fileUrls  // Store Cloudinary URLs
           });
         }
         
@@ -139,11 +195,11 @@ export const geminiChat = async (req: Request, res: Response) => {
           content: assistantResponse
         });
       } catch (dbErr) {
-        console.warn('DB save failed:', (dbErr as Error).message);
+        console.warn('Database save failed:', (dbErr as Error).message);
       }
     }
 
-    // 🧠 Save to long-term memory
+    // 🧠 Save to memory
     try {
       if (userId !== 'guest') {
         const memoryData = [];
