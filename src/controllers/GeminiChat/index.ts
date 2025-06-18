@@ -1,7 +1,6 @@
 import fs from 'fs';
 import axios from 'axios';
 import { Request, Response } from 'express';
-import { ChatSession } from '@google/generative-ai';
 import { genAI } from '../../config/geminiConfig';
 import MemoryClient from 'mem0ai';
 import Message from '../../models/messageModel';
@@ -24,78 +23,87 @@ export const geminiChat = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'No message or files provided' });
     }
 
-    const parts: any[] = [];
-    const fileUrls: string[] = [];
-    let chatHistory: any[] = [];
-
-    // 🗂 Fetch chat history
+    // 1. RETRIEVE CONTEXT ================================================
+    // 🧠 Get long-term memory from mem0
+    let longTermMemory: any[] = [];
     try {
-      if (chatId) {
-        const messages = await Message.find({ chat: chatId }).sort({ createdAt: 1 });
-
-        const mappedHistory = messages
-          .map((m: any) => ({
-            role: m.role === 'user' ? 'user' : 'model',
-            parts: [{ text: m.content }],
-          }))
-          .filter((m: any) => typeof m.parts[0]?.text === 'string' && m.parts[0].text.trim().length > 0);
-
-        while (mappedHistory.length > 0 && mappedHistory[0].role !== 'user') {
-          mappedHistory.shift();
-        }
-
-        chatHistory = mappedHistory;
-      }
-    } catch (err) {
-      console.warn('Chat history fetch failed:', (err as Error).message);
-    }
-
-    // 🧠 Save user message to mem0 (optional)
-    try {
-      if (userId && message) {
-        await mem0.add([{ role: 'user', content: message }], { user_id: userId });
+      if (userId !== 'guest') {
+        const query = message || "User uploaded file(s)";
+        const memories = await mem0.search(userId, query);
+        longTermMemory = memories.map((mem: any) => ({
+          role: mem.role,
+          parts: [{ text: mem.content }]
+        }));
       }
     } catch (memErr) {
-      console.warn('Memory store failed:', (memErr as Error).message);
+      console.warn('Memory retrieval failed:', (memErr as Error).message);
     }
 
-    // 💬 Add user's message
-    if (message) {
-      parts.push({ text: message });
+    // 💬 Get current chat history
+    let chatHistory: any[] = [];
+    if (chatId) {
+      try {
+        const messages = await Message.find({ chat: chatId }).sort({ createdAt: 1 });
+        
+        // Ensure strict role alternation starting with user
+        let lastRole = '';
+        chatHistory = messages.reduce((acc: any[], m: any) => {
+          if (m.role === 'user' && lastRole !== 'user') {
+            acc.push({ role: 'user', parts: [{ text: m.content }] });
+            lastRole = 'user';
+          } else if (m.role === 'assistant' && lastRole !== 'model') {
+            acc.push({ role: 'model', parts: [{ text: m.content }] });
+            lastRole = 'model';
+          }
+          return acc;
+        }, []);
+      } catch (err) {
+        console.warn('Chat history fetch failed:', (err as Error).message);
+      }
     }
 
-    // 📎 Handle file uploads
+    // Combine memory and history with proper alternation
+    const fullHistory = [...longTermMemory, ...chatHistory];
+
+    // 2. PREPARE CURRENT MESSAGE ========================================
+    const parts: any[] = [];
+    const fileUrls: string[] = [];
+
+    // 💬 Text content
+    if (message) parts.push({ text: message });
+
+    // 📎 File attachments
     if (files?.length) {
       for (const file of files) {
         try {
-          let b64: string;
+          // Handle remote URLs differently
           if (file.path.startsWith('http')) {
-            b64 = await fetchBase64FromUrl(file.path);
+            const b64 = await fetchBase64FromUrl(file.path);
+            parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
             fileUrls.push(file.path);
-          } else {
-            b64 = fs.readFileSync(file.path, 'base64');
+          } 
+          // Local files
+          else {
+            const b64 = fs.readFileSync(file.path, 'base64');
+            parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
+            // Optional: Clean up temp file if needed
           }
-
-          parts.push({
-            inlineData: { data: b64, mimeType: file.mimetype },
-          });
         } catch (fileErr) {
           console.warn('File processing failed:', (fileErr as Error).message);
         }
       }
     }
 
-
-    // 🚀 Start Gemini chat session with PRO model
-    const generativeModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-    const chat: ChatSession = generativeModel.startChat({
-      history: chatHistory,
-      generationConfig: { maxOutputTokens: 2000 },
+    // 3. EXECUTE CHAT ====================================================
+    const model = genAI.getGenerativeModel({ 
+      model: 'gemini-2.0-flash',
+      generationConfig: { maxOutputTokens: 2000 }
     });
-
+    
+    const chat = model.startChat({ history: fullHistory });
     const result = await chat.sendMessageStream(parts);
 
-    // 📤 Stream response to client
+    // 4. STREAM RESPONSE ================================================
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -112,15 +120,50 @@ export const geminiChat = async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify({ type: 'done', fileUrls })}\n\n`);
     res.end();
 
-    // 🧠 Save assistant response to mem0
-    if (assistantResponse) {
+    // 5. PERSIST INTERACTION ==========================================
+    // 💾 Save to database (if chatId exists)
+    if (chatId) {
       try {
-        await mem0.add([{ role: 'assistant', content: assistantResponse }], {
-          user_id: userId,
+        if (message || files.length) {
+          await Message.create({
+            chat: chatId,
+            role: 'user',
+            content: message || "Uploaded file(s)",
+            attachments: fileUrls
+          });
+        }
+        
+        await Message.create({
+          chat: chatId,
+          role: 'assistant',
+          content: assistantResponse
         });
-      } catch (err) {
-        console.warn('Failed to save assistant response to memory:', (err as Error).message);
+      } catch (dbErr) {
+        console.warn('DB save failed:', (dbErr as Error).message);
       }
+    }
+
+    // 🧠 Save to long-term memory
+    try {
+      if (userId !== 'guest') {
+        const memoryData = [];
+        
+        if (message || files.length) {
+          memoryData.push({ 
+            role: 'user', 
+            content: message || "User uploaded files" 
+          });
+        }
+        
+        memoryData.push({ 
+          role: 'assistant', 
+          content: assistantResponse 
+        });
+        
+        await mem0.add(memoryData as { role: 'user' | 'assistant'; content: string }[], { user_id: userId });
+      }
+    } catch (memErr) {
+      console.warn('Memory save failed:', (memErr as Error).message);
     }
 
   } catch (err) {

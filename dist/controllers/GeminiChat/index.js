@@ -40,70 +40,83 @@ const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         if (!message && (!files || files.length === 0)) {
             return res.status(400).json({ message: 'No message or files provided' });
         }
-        const parts = [];
-        const fileUrls = [];
-        let chatHistory = [];
-        // 🗂 Fetch chat history
+        // 1. RETRIEVE CONTEXT ================================================
+        // 🧠 Get long-term memory from mem0
+        let longTermMemory = [];
         try {
-            if (chatId) {
-                const messages = yield messageModel_1.default.find({ chat: chatId }).sort({ createdAt: 1 });
-                const mappedHistory = messages
-                    .map((m) => ({
-                    role: m.role === 'user' ? 'user' : 'model',
-                    parts: [{ text: m.content }],
-                }))
-                    .filter((m) => { var _a; return typeof ((_a = m.parts[0]) === null || _a === void 0 ? void 0 : _a.text) === 'string' && m.parts[0].text.trim().length > 0; });
-                while (mappedHistory.length > 0 && mappedHistory[0].role !== 'user') {
-                    mappedHistory.shift();
-                }
-                chatHistory = mappedHistory;
-            }
-        }
-        catch (err) {
-            console.warn('Chat history fetch failed:', err.message);
-        }
-        // 🧠 Save user message to mem0 (optional)
-        try {
-            if (userId && message) {
-                yield mem0.add([{ role: 'user', content: message }], { user_id: userId });
+            if (userId !== 'guest') {
+                const query = message || "User uploaded file(s)";
+                const memories = yield mem0.search(userId, query);
+                longTermMemory = memories.map((mem) => ({
+                    role: mem.role,
+                    parts: [{ text: mem.content }]
+                }));
             }
         }
         catch (memErr) {
-            console.warn('Memory store failed:', memErr.message);
+            console.warn('Memory retrieval failed:', memErr.message);
         }
-        // 💬 Add user's message
-        if (message) {
+        // 💬 Get current chat history
+        let chatHistory = [];
+        if (chatId) {
+            try {
+                const messages = yield messageModel_1.default.find({ chat: chatId }).sort({ createdAt: 1 });
+                // Ensure strict role alternation starting with user
+                let lastRole = '';
+                chatHistory = messages.reduce((acc, m) => {
+                    if (m.role === 'user' && lastRole !== 'user') {
+                        acc.push({ role: 'user', parts: [{ text: m.content }] });
+                        lastRole = 'user';
+                    }
+                    else if (m.role === 'assistant' && lastRole !== 'model') {
+                        acc.push({ role: 'model', parts: [{ text: m.content }] });
+                        lastRole = 'model';
+                    }
+                    return acc;
+                }, []);
+            }
+            catch (err) {
+                console.warn('Chat history fetch failed:', err.message);
+            }
+        }
+        // Combine memory and history with proper alternation
+        const fullHistory = [...longTermMemory, ...chatHistory];
+        // 2. PREPARE CURRENT MESSAGE ========================================
+        const parts = [];
+        const fileUrls = [];
+        // 💬 Text content
+        if (message)
             parts.push({ text: message });
-        }
-        // 📎 Handle file uploads
+        // 📎 File attachments
         if (files === null || files === void 0 ? void 0 : files.length) {
             for (const file of files) {
                 try {
-                    let b64;
+                    // Handle remote URLs differently
                     if (file.path.startsWith('http')) {
-                        b64 = yield fetchBase64FromUrl(file.path);
+                        const b64 = yield fetchBase64FromUrl(file.path);
+                        parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
                         fileUrls.push(file.path);
                     }
+                    // Local files
                     else {
-                        b64 = fs_1.default.readFileSync(file.path, 'base64');
+                        const b64 = fs_1.default.readFileSync(file.path, 'base64');
+                        parts.push({ inlineData: { data: b64, mimeType: file.mimetype } });
+                        // Optional: Clean up temp file if needed
                     }
-                    parts.push({
-                        inlineData: { data: b64, mimeType: file.mimetype },
-                    });
                 }
                 catch (fileErr) {
                     console.warn('File processing failed:', fileErr.message);
                 }
             }
         }
-        // 🚀 Start Gemini chat session with PRO model
-        const generativeModel = geminiConfig_1.genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const chat = generativeModel.startChat({
-            history: chatHistory,
-            generationConfig: { maxOutputTokens: 2000 },
+        // 3. EXECUTE CHAT ====================================================
+        const model = geminiConfig_1.genAI.getGenerativeModel({
+            model: 'gemini-2.0-flash',
+            generationConfig: { maxOutputTokens: 2000 }
         });
+        const chat = model.startChat({ history: fullHistory });
         const result = yield chat.sendMessageStream(parts);
-        // 📤 Stream response to client
+        // 4. STREAM RESPONSE ================================================
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -129,16 +142,47 @@ const geminiChat = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         }
         res.write(`data: ${JSON.stringify({ type: 'done', fileUrls })}\n\n`);
         res.end();
-        // 🧠 Save assistant response to mem0
-        if (assistantResponse) {
+        // 5. PERSIST INTERACTION ==========================================
+        // 💾 Save to database (if chatId exists)
+        if (chatId) {
             try {
-                yield mem0.add([{ role: 'assistant', content: assistantResponse }], {
-                    user_id: userId,
+                if (message || files.length) {
+                    yield messageModel_1.default.create({
+                        chat: chatId,
+                        role: 'user',
+                        content: message || "Uploaded file(s)",
+                        attachments: fileUrls
+                    });
+                }
+                yield messageModel_1.default.create({
+                    chat: chatId,
+                    role: 'assistant',
+                    content: assistantResponse
                 });
             }
-            catch (err) {
-                console.warn('Failed to save assistant response to memory:', err.message);
+            catch (dbErr) {
+                console.warn('DB save failed:', dbErr.message);
             }
+        }
+        // 🧠 Save to long-term memory
+        try {
+            if (userId !== 'guest') {
+                const memoryData = [];
+                if (message || files.length) {
+                    memoryData.push({
+                        role: 'user',
+                        content: message || "User uploaded files"
+                    });
+                }
+                memoryData.push({
+                    role: 'assistant',
+                    content: assistantResponse
+                });
+                yield mem0.add(memoryData, { user_id: userId });
+            }
+        }
+        catch (memErr) {
+            console.warn('Memory save failed:', memErr.message);
         }
     }
     catch (err) {

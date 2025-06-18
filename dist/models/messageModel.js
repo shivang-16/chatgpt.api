@@ -37,7 +37,6 @@ const MessageSchema = new mongoose_1.Schema({
     },
     content: {
         type: String,
-        required: true,
     },
     files: Array,
     createdAt: {

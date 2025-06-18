@@ -21,7 +21,6 @@ const MessageSchema: Schema = new Schema({
     },
     content: {
         type: String,
-        required: true,
     },
     files: Array,
     createdAt: {
