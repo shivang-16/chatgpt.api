@@ -7,17 +7,17 @@ import MemoryClient from 'mem0ai';
 import Message from '../../models/messageModel';
 
 const mem0 = new MemoryClient({ apiKey: process.env.MEM0_API_KEY! });
+console.log("✅ Mem0 initialized:", !!process.env.MEM0_API_KEY);
 
 const fetchCloudinaryFile = async (url: string): Promise<{ data: string; mimeType: string }> => {
   try {
     const cloudinaryUrl = new URL(url);
     const pathParts = cloudinaryUrl.pathname.split('/');
-    
     const originalFormat = pathParts[pathParts.length - 1].split('.')[1];
-    
-    cloudinaryUrl.searchParams.set('f_auto', 'true');  
-    cloudinaryUrl.searchParams.set('fl_lossy', 'true'); 
-    
+
+    cloudinaryUrl.searchParams.set('f_auto', 'true');
+    cloudinaryUrl.searchParams.set('fl_lossy', 'true');
+
     const response = await axios.get(cloudinaryUrl.toString(), {
       responseType: 'arraybuffer',
       timeout: 10000,
@@ -25,8 +25,8 @@ const fetchCloudinaryFile = async (url: string): Promise<{ data: string; mimeTyp
 
     return {
       data: Buffer.from(response.data).toString('base64'),
-      mimeType: response.headers['content-type'] || 
-                mime.lookup(originalFormat || url) || 
+      mimeType: response.headers['content-type'] ||
+                mime.lookup(originalFormat || url) ||
                 'application/octet-stream'
     };
   } catch (error) {
@@ -46,62 +46,66 @@ export const geminiChat = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'No message or files provided' });
     }
 
-    // 1. CONTEXT RETRIEVAL =================================================
     // 🧠 Long-term memory
     let longTermMemory: any[] = [];
     try {
       if (userId !== 'guest') {
         const query = message || "User uploaded file(s)";
-        const memories = await mem0.search(userId, query);
-        longTermMemory = memories.map((mem: any) => ({
-          role: mem.role,
-          parts: [{ text: mem.content }]
+        console.log(`🔍 Searching memory for userId="${userId}" with query="${query}"`);
+        
+        const memories: any = await mem0.getAll({
+          user_id: userId,
+          page: 1,
+          page_size: 50
+        });
+    
+        console.log(`📦 Retrieved ${memories?.results?.length ?? 0} memory entries`);
+        longTermMemory = (memories.results || [])?.map((mem: any) => ({
+          role: mem.user_id === userId ? 'user' : 'model',
+          parts: [{ text: mem.memory }]
         }));
       }
     } catch (memErr) {
-      console.warn('Memory retrieval failed:', (memErr as Error).message);
+      console.warn('⚠️ Memory retrieval failed:', (memErr as Error).message);
     }
+    
 
     // 💬 Chat history with files
     let chatHistory: any[] = [];
     if (chatId) {
       try {
         const messages = await Message.find({ chat: chatId }).sort({ createdAt: 1 });
-        
-        // Process historical messages with files
+
         const historyPromises = messages.map(async (msg: any) => {
           const parts: any[] = [];
-          
+
           if (msg.content) {
             parts.push({ text: msg.content });
           }
-          
+
           if (msg.files?.length) {
             const filePromises = msg.files.map(async (fileUrl: string) => {
               try {
                 const { data, mimeType } = await fetchCloudinaryFile(fileUrl);
-                return {
-                  inlineData: { data, mimeType }
-                };
+                return { inlineData: { data, mimeType } };
               } catch (err) {
-                console.warn(`Skipping historical file: ${fileUrl}`, err);
+                console.warn(`⚠️ Skipping historical file: ${fileUrl}`, err);
                 return null;
               }
             });
-            
+
             const fileParts = (await Promise.all(filePromises)).filter(Boolean);
             parts.push(...fileParts);
           }
-          
+
           return {
             role: msg.role === 'user' ? 'user' : 'model',
             parts
           };
         });
-        
+
         const rawHistory = await Promise.all(historyPromises);
-        
-        // Ensure role alternation
+
         let lastRole = '';
         chatHistory = rawHistory.filter(entry => {
           if (entry.parts.length === 0) return false;
@@ -109,27 +113,24 @@ export const geminiChat = async (req: Request, res: Response) => {
           lastRole = entry.role;
           return true;
         });
-        
       } catch (err) {
-        console.warn('Chat history processing failed:', (err as Error).message);
+        console.warn('⚠️ Chat history processing failed:', (err as Error).message);
       }
     }
 
-    // Combine context sources
+    // Combine context
     const fullHistory = [...longTermMemory, ...chatHistory];
 
     const parts: any[] = [];
     const fileUrls: string[] = [];
 
-    // 💬 Text content
     if (message) parts.push({ text: message });
 
-    // 📎 Current file attachments
     if (files?.length) {
       await Promise.all(files.map(async (file) => {
         try {
           let fileData: { data: string; mimeType: string };
-          
+
           if (file.path.startsWith('http')) {
             fileData = await fetchCloudinaryFile(file.path);
           } else {
@@ -138,7 +139,7 @@ export const geminiChat = async (req: Request, res: Response) => {
               mimeType: file.mimetype
             };
           }
-          
+
           parts.push({
             inlineData: {
               data: fileData.data,
@@ -147,16 +148,16 @@ export const geminiChat = async (req: Request, res: Response) => {
           });
           fileUrls.push(file.path);
         } catch (fileErr) {
-          console.warn('Current file processing failed:', (fileErr as Error).message);
+          console.warn('⚠️ File processing failed:', (fileErr as Error).message);
         }
       }));
     }
 
-    const model = genAI.getGenerativeModel({ 
+    const model = genAI.getGenerativeModel({
       model: 'gemini-2.0-flash',
       generationConfig: { maxOutputTokens: 2000 }
     });
-    
+
     const chat = model.startChat({ history: fullHistory });
     const result = await chat.sendMessageStream(parts);
 
@@ -176,8 +177,7 @@ export const geminiChat = async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify({ type: 'done', fileUrls })}\n\n`);
     res.end();
 
-    // 5. DATA PERSISTENCE =================================================
-    // 💾 Save to database
+    // 💾 Save to DB
     if (chatId) {
       try {
         if (message || files.length) {
@@ -185,17 +185,17 @@ export const geminiChat = async (req: Request, res: Response) => {
             chat: chatId,
             role: 'user',
             content: message || "Uploaded file(s)",
-            files: fileUrls  // Store Cloudinary URLs
+            files: fileUrls
           });
         }
-        
+
         await Message.create({
           chat: chatId,
           role: 'assistant',
           content: assistantResponse
         });
       } catch (dbErr) {
-        console.warn('Database save failed:', (dbErr as Error).message);
+        console.warn('⚠️ DB save failed:', (dbErr as Error).message);
       }
     }
 
@@ -203,27 +203,35 @@ export const geminiChat = async (req: Request, res: Response) => {
     try {
       if (userId !== 'guest') {
         const memoryData = [];
-        
+
         if (message || files.length) {
-          memoryData.push({ 
-            role: 'user', 
-            content: message || "User uploaded files" 
+          memoryData.push({
+            role: 'user',
+            content: message || 'User uploaded files'
           });
         }
-        
-        memoryData.push({ 
-          role: 'assistant', 
-          content: assistantResponse 
+
+        memoryData.push({
+          role: 'assistant',
+          content: assistantResponse
         });
-        
-        await mem0.add(memoryData as { role: 'user' | 'assistant'; content: string }[], { user_id: userId });
+
+        console.log('🧠 Saving to Mem0:', { userId, memoryData });
+
+        await mem0.add(
+          memoryData.map(m => ({
+            role: m.role as 'user' | 'assistant',
+            content: m.content
+          })),
+          { user_id: userId }
+        );
       }
     } catch (memErr) {
-      console.warn('Memory save failed:', (memErr as Error).message);
+      console.warn('⚠️ Memory save failed:', (memErr as Error).message);
     }
 
   } catch (err) {
-    console.error('Gemini chat error:', err);
+    console.error('❌ Gemini chat error:', err);
     res.status(500).json({
       message: 'Error processing chat request',
       error: (err as Error).message,
