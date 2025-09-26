@@ -26,8 +26,8 @@ export const checkAuth = async (
     token = req.headers.authorization.split(' ')[1];
   }
 
-  if (!token) return next(new CustomError("Login First", 401));
-
+  // if (!token) return next(new CustomError("Login First", 401));
+  console.log(token)
   const secret = process.env.JWT_SECRET;
   if (!secret) return next(new CustomError("Jwt Secret not defined", 400));
 
