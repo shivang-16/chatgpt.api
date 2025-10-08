@@ -9,9 +9,9 @@ export const createChat = async (req: Request, res: Response) => {
     const { name } = req.body;
     const userId = req.user?._id; // Assuming user ID is available in req.user
 
-    // if (!userId) {
-    //   return res.status(401).json({ message: 'User not authenticated' });
-    // }
+if (!userId) {
+return res.status(401).json({ message: 'User not authenticated' });
+}
 
 // console.log(userId, "here is the userId")
     const newChat = new Chat({
