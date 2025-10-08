@@ -13,7 +13,7 @@ export const createChat = async (req: Request, res: Response) => {
     //   return res.status(401).json({ message: 'User not authenticated' });
     // }
 
-    console.log(userId, "here is the userId")
+// console.log(userId, "here is the userId")
     const newChat = new Chat({
       heading: name,
       user: userId,
