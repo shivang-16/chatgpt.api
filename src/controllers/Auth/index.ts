@@ -26,6 +26,8 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
       password, // Pass plain password, pre-save hook will hash it
     });
 
+    console.log(firstnmae, lastname, newuser)
+
     await newUser.save();
 
     setCookie({
